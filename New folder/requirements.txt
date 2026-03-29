@@ -1,4 +1,0 @@
-flask
-requests
-MetaTrader5
-python-dotenv
