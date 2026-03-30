@@ -16,8 +16,11 @@ MT5_SERVER     = os.getenv("MT5_SERVER")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# --- SYMBOLS TO TRADE ---
+SYMBOLS = ["XAUUSD", "XAGUSD", "US500", "NZDUSD"]
+SYMBOL  = "XAUUSD"  # Default fallback
+
 # --- SETTINGS ---
-SYMBOL         = "XAUUSD"
 TIMEFRAME_30   = mt5.TIMEFRAME_M30
 TIMEFRAME_4H   = mt5.TIMEFRAME_H4
 TIMEFRAME_1H   = mt5.TIMEFRAME_H1
@@ -41,20 +44,19 @@ POSTNY_END    = 22
 
 # ═══════════════════════════════════════════
 # AUTO DST DETECTION
+# UK BST: last Sunday March → last Sunday October
 # ═══════════════════════════════════════════
 def get_bias_hours():
     now  = datetime.now(timezone.utc)
     year = now.year
 
-    # Last Sunday of March — BST starts
     march_end = datetime(year, 4, 1, tzinfo=timezone.utc)
     bst_start = march_end - timedelta(days=(march_end.weekday() + 1) % 7)
     bst_start = bst_start.replace(hour=1)
 
-    # Last Sunday of October — BST ends
-    oct_end   = datetime(year, 11, 1, tzinfo=timezone.utc)
-    bst_end   = oct_end - timedelta(days=(oct_end.weekday() + 1) % 7)
-    bst_end   = bst_end.replace(hour=1)
+    oct_end = datetime(year, 11, 1, tzinfo=timezone.utc)
+    bst_end = oct_end - timedelta(days=(oct_end.weekday() + 1) % 7)
+    bst_end = bst_end.replace(hour=1)
 
     is_bst = bst_start <= now < bst_end
     return (2, 6) if is_bst else (1, 5)
@@ -94,10 +96,11 @@ def connect_mt5():
     return True
 
 # ═══════════════════════════════════════════
-# GET CANDLES
+# GET CANDLES — symbol aware
 # ═══════════════════════════════════════════
-def get_candles(timeframe, count=500):
-    rates = mt5.copy_rates_from_pos(SYMBOL, timeframe, 0, count)
+def get_candles(timeframe, count=500, symbol=None):
+    sym   = symbol or SYMBOL
+    rates = mt5.copy_rates_from_pos(sym, timeframe, 0, count)
     if rates is None or len(rates) == 0:
         return None
     df = pd.DataFrame(rates)
@@ -143,20 +146,21 @@ def calc_macd(series):
     return macd, signal
 
 # ═══════════════════════════════════════════
-# WEEKLY BIAS — Monday 1AM + 5AM 4H candles
+# WEEKLY BIAS — Uses 1H candles
+# Monday bias_h1 and bias_h2 candles
+# 1H candle closes after 1 hour so bias
+# available much earlier than 4H approach
 # ═══════════════════════════════════════════
-def get_weekly_bias(df_4h):
+def get_weekly_bias(df_1h):
     bias_h1, bias_h2 = get_bias_hours()
-    df = df_4h.copy()
+    df = df_1h.copy()
     df['dow']  = df['time'].dt.dayofweek  # 0 = Monday
     df['hour'] = df['time'].dt.hour
 
-    # Get most recent Monday bias candles
     mon = df[(df['dow'] == 0) & (df['hour'].isin([bias_h1, bias_h2]))]
     if len(mon) == 0:
         return None, None, False, False, False
 
-    # Most recent ISO week
     latest_week = mon['time'].dt.isocalendar().week.iloc[-1]
     latest_year = mon['time'].dt.isocalendar().year.iloc[-1]
     this_week   = mon[
@@ -169,35 +173,32 @@ def get_weekly_bias(df_4h):
     wb_high = this_week['high'].max()
     wb_low  = this_week['low'].min()
 
-    # Use most recent 4H close for bias confirmation
-    c4h = df['close'].iloc[-1]
+    c = df['close'].iloc[-1]
 
-    wk_bull = c4h > wb_high
-    wk_bear = c4h < wb_low
+    wk_bull = c > wb_high
+    wk_bear = c < wb_low
 
-    # Reversal warning — price returned inside range after confirming
     wk_rev = False
-    confirmed_bull_bars = df[df['close'] > wb_high]
-    confirmed_bear_bars = df[df['close'] < wb_low]
-    if len(confirmed_bull_bars) > 0 and (wb_low < c4h < wb_high):
-        wk_rev = True
-        wk_bull = False
-    elif len(confirmed_bear_bars) > 0 and (wb_low < c4h < wb_high):
-        wk_rev = True
-        wk_bear = False
+    if not wk_bull and not wk_bear and (wb_low < c < wb_high):
+        confirmed_bull = df[df['close'] > wb_high]
+        confirmed_bear = df[df['close'] < wb_low]
+        if len(confirmed_bull) > 0 or len(confirmed_bear) > 0:
+            wk_rev = True
 
     return wb_high, wb_low, wk_bull, wk_bear, wk_rev
 
 # ═══════════════════════════════════════════
-# DAILY BIAS — 1AM 4H candle each day
+# DAILY BIAS — Uses 1H candles
+# Daily bias_h1 candle each day
+# 1H candle closes after 1 hour so available
+# by 3AM UTC — well before London open
 # ═══════════════════════════════════════════
-def get_daily_bias(df_4h):
+def get_daily_bias(df_1h):
     bias_h1, _ = get_bias_hours()
-    df   = df_4h.copy()
+    df = df_1h.copy()
     df['hour'] = df['time'].dt.hour
     df['date'] = df['time'].dt.date
 
-    # Try today first, then yesterday
     dates = sorted(df['date'].unique())
     daily_candle = None
     for d in reversed(dates):
@@ -211,10 +212,10 @@ def get_daily_bias(df_4h):
 
     db_high = daily_candle['high']
     db_low  = daily_candle['low']
-    c4h     = df['close'].iloc[-1]
+    c       = df['close'].iloc[-1]
 
-    d_bull = c4h > db_high
-    d_bear = c4h < db_low
+    d_bull = c > db_high
+    d_bear = c < db_low
 
     return db_high, db_low, d_bull, d_bear
 
@@ -232,7 +233,6 @@ def get_htf_ema(df_1h, df_4h):
 
 # ═══════════════════════════════════════════
 # PREVIOUS DAY HIGH / LOW
-# Uses actual daily boundaries not rolling window
 # ═══════════════════════════════════════════
 def get_prev_day_hl(df_30):
     df = df_30.copy()
@@ -273,49 +273,35 @@ def get_prev_month_hl(df_30):
     return prev['high'].max(), prev['low'].min()
 
 # ═══════════════════════════════════════════
-# BOS — Break of Structure
+# BOS
 # ═══════════════════════════════════════════
 def check_bos(df, atr_series, bos_reset=30):
     close  = df['close']
     open_  = df['open']
     ema200 = calc_ema(close, 200)
-
     sw_high = df['high'].rolling(11, center=True).max()
     sw_low  = df['low'].rolling(11,  center=True).min()
-
     strong_body = abs(close - open_) > atr_series * 0.5
     above_e200  = close > ema200
     below_e200  = close < ema200
-
     bull_bos = (close > sw_high.shift(1)) & strong_body & above_e200 & (close.shift(1) <= sw_high.shift(1))
     bear_bos = (close < sw_low.shift(1))  & strong_body & below_e200 & (close.shift(1) >= sw_low.shift(1))
-
-    # Recent BOS within bos_reset bars
-    recent_bull = bull_bos.iloc[-bos_reset:].any()
-    recent_bear = bear_bos.iloc[-bos_reset:].any()
-
-    return recent_bull, recent_bear
+    return bull_bos.iloc[-bos_reset:].any(), bear_bos.iloc[-bos_reset:].any()
 
 # ═══════════════════════════════════════════
 # SWEEPS
-# Uses actual previous day high/low
 # ═══════════════════════════════════════════
 def check_sweeps(df, atr_series, d1h, d1l):
     if d1h is None or d1l is None:
         return False, False, False, False, None, None
-
     last = df.iloc[-2]
     atr  = atr_series.iloc[-2]
-
     bull_sweep = (last['low'] < d1l) and (last['close'] > d1l) and ((d1l - last['low']) >= atr * 0.3)
     bear_sweep = (last['high'] > d1h) and (last['close'] < d1h) and ((last['high'] - d1h) >= atr * 0.3)
-
     bull_sw_rej = bull_sweep and ((last['close'] - last['low'])  > atr * 0.7)
     bear_sw_rej = bear_sweep and ((last['high']  - last['close']) > atr * 0.7)
-
     last_bull_sw_low  = last['low']  if bull_sweep else None
     last_bear_sw_high = last['high'] if bear_sweep else None
-
     return bull_sweep, bear_sweep, bull_sw_rej, bear_sw_rej, last_bull_sw_low, last_bear_sw_high
 
 # ═══════════════════════════════════════════
@@ -325,7 +311,6 @@ def check_internal_sweep(df, above_e200, below_e200):
     low3  = df['low'].iloc[-4:-1].min()
     high3 = df['high'].iloc[-4:-1].max()
     last  = df.iloc[-2]
-
     int_bull = (last['low'] < low3)   and (last['close'] > low3)  and above_e200
     int_bear = (last['high'] > high3) and (last['close'] < high3) and below_e200
     return int_bull, int_bear
@@ -334,22 +319,15 @@ def check_internal_sweep(df, above_e200, below_e200):
 # EQUAL HIGHS / LOWS SWEPT
 # ═══════════════════════════════════════════
 def check_eql_swept(df, atr):
-    pivot_h = df['high'].rolling(11, center=True).max()
-    pivot_l = df['low'].rolling(11,  center=True).min()
-
     ph  = df['high'].iloc[-12]
     pph = df['high'].iloc[-23]
     pl  = df['low'].iloc[-12]
     ppl = df['low'].iloc[-23]
-
     last = df.iloc[-2]
-
     is_eqh = abs(ph - pph) <= atr * 0.1 if not pd.isna(ph) and not pd.isna(pph) else False
     is_eql = abs(pl - ppl) <= atr * 0.1 if not pd.isna(pl) and not pd.isna(ppl) else False
-
     eqh_swept = is_eqh and (last['high'] > ph) and (last['close'] < ph)
     eql_swept = is_eql and (last['low']  < pl) and (last['close'] > pl)
-
     return eqh_swept, eql_swept
 
 # ═══════════════════════════════════════════
@@ -361,26 +339,20 @@ def check_fvg(df, atr_series, above_e200, below_e200,
               bias_sca_bull, bias_sca_bear):
     if len(df) < 5:
         return False, False
-
     last  = df.iloc[-2]
     prev1 = df.iloc[-3]
     prev2 = df.iloc[-4]
     atr   = atr_series.iloc[-3]
-
-    body    = abs(prev1['close'] - prev1['open'])
-    str_cdl = body > atr * 1.0
+    body     = abs(prev1['close'] - prev1['open'])
+    str_cdl  = body > atr * 1.0
     disp_cdl = abs(last['close'] - last['open']) > atr_series.iloc[-2] * 1.5
-
     b_fvg_sz  = prev1['low']  - prev2['high']
     br_fvg_sz = prev2['low']  - prev1['high']
-
     fvg_min = 0.5
     b_fvg  = (b_fvg_sz  > 0) and str_cdl and (prev1['close'] > prev1['open']) and above_e200 and (b_fvg_sz  >= atr * fvg_min)
     br_fvg = (br_fvg_sz > 0) and str_cdl and (prev1['close'] < prev1['open']) and below_e200 and (br_fvg_sz >= atr * fvg_min)
-
     bull_fvg_ez = b_fvg  and disp_cdl and above_e200 and (wk_bull or bias_med_bull or bias_sca_bull)
     bear_fvg_ez = br_fvg and disp_cdl and below_e200 and (wk_bear or bias_med_bear or bias_sca_bear)
-
     return bull_fvg_ez, bear_fvg_ez
 
 # ═══════════════════════════════════════════
@@ -389,34 +361,26 @@ def check_fvg(df, atr_series, above_e200, below_e200,
 def check_ob(df, atr_series, above_e200, below_e200):
     if len(df) < 6:
         return False, False
-
     close = df['close']
     open_ = df['open']
     imp   = 3
-
     bull_imp = all(close.iloc[-i] > close.iloc[-i-1] for i in range(1, imp+1))
     bear_imp = all(close.iloc[-i] < close.iloc[-i-1] for i in range(1, imp+1))
-
     atr = atr_series.iloc[-1]
-
     bull_ob_cond = bull_imp and (close.iloc[-imp-1] < open_.iloc[-imp-1]) and (abs(close.iloc[-imp-1] - open_.iloc[-imp-1]) > atr * 0.5) and above_e200
     bear_ob_cond = bear_imp and (close.iloc[-imp-1] > open_.iloc[-imp-1]) and (abs(close.iloc[-imp-1] - open_.iloc[-imp-1]) > atr * 0.5) and below_e200
-
     bull_ob_rsp = False
     bear_ob_rsp = False
-
     if bull_ob_cond:
         ob_top = df['high'].iloc[-imp-1]
         ob_bot = df['low'].iloc[-imp-1]
         if df['low'].iloc[-1] <= ob_top and df['close'].iloc[-1] >= ob_bot:
             bull_ob_rsp = True
-
     if bear_ob_cond:
         ob_top = df['high'].iloc[-imp-1]
         ob_bot = df['low'].iloc[-imp-1]
         if df['high'].iloc[-1] >= ob_bot and df['close'].iloc[-1] <= ob_top:
             bear_ob_rsp = True
-
     return bull_ob_rsp, bear_ob_rsp
 
 # ═══════════════════════════════════════════
@@ -426,26 +390,24 @@ def check_rsi_div(df, rsi_series):
     lkb = 7
     low  = df['low']
     high = df['high']
-
     p_ll = low.iloc[-lkb:].min()   < low.iloc[-2*lkb:-lkb].min()
     p_hl = low.iloc[-lkb:].min()   > low.iloc[-2*lkb:-lkb].min()
     p_hh = high.iloc[-lkb:].max()  > high.iloc[-2*lkb:-lkb].max()
     p_lh = high.iloc[-lkb:].max()  < high.iloc[-2*lkb:-lkb].max()
-
     r_hl = rsi_series.iloc[-lkb:].min() > rsi_series.iloc[-2*lkb:-lkb].min()
     r_ll = rsi_series.iloc[-lkb:].min() < rsi_series.iloc[-2*lkb:-lkb].min()
     r_lh = rsi_series.iloc[-lkb:].max() < rsi_series.iloc[-2*lkb:-lkb].max()
     r_hh = rsi_series.iloc[-lkb:].max() > rsi_series.iloc[-2*lkb:-lkb].max()
-
     return (p_ll and r_hl), (p_hl and r_ll), (p_hh and r_lh), (p_lh and r_hh)
 
 # ═══════════════════════════════════════════
-# PLACE TRADE
+# PLACE TRADE — symbol aware
 # ═══════════════════════════════════════════
-def place_trade(signal, sl_price, tp_price, lot_size):
-    tick = mt5.symbol_info_tick(SYMBOL)
+def place_trade(signal, sl_price, tp_price, lot_size, symbol=None):
+    sym  = symbol or SYMBOL
+    tick = mt5.symbol_info_tick(sym)
     if tick is None:
-        send_telegram("❌ Failed to get XAUUSD price!")
+        send_telegram(f"❌ Failed to get price for {sym}!")
         return
 
     price      = tick.ask if signal == "BUY" else tick.bid
@@ -453,7 +415,7 @@ def place_trade(signal, sl_price, tp_price, lot_size):
 
     req = {
         "action":       mt5.TRADE_ACTION_DEAL,
-        "symbol":       SYMBOL,
+        "symbol":       sym,
         "volume":       lot_size,
         "type":         order_type,
         "price":        price,
@@ -461,7 +423,7 @@ def place_trade(signal, sl_price, tp_price, lot_size):
         "tp":           tp_price,
         "deviation":    20,
         "magic":        234000,
-        "comment":      "Mannys Gold Bot V3",
+        "comment":      "Mannys Bot V3",
         "type_time":    mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
@@ -470,13 +432,15 @@ def place_trade(signal, sl_price, tp_price, lot_size):
     account = mt5.account_info()
 
     if result.retcode != mt5.TRADE_RETCODE_DONE:
-        send_telegram(f"❌ <b>TRADE FAILED</b>\nSignal: {signal}\nError: {result.comment}")
+        send_telegram(f"❌ <b>TRADE FAILED</b>\n{sym} {signal}\nError: {result.comment}")
         print(f"Trade failed: {result.comment}")
     else:
+        h1, _ = get_bias_hours()
+        dst_str = "BST" if h1 == 2 else "GMT"
         send_telegram(
-            f"🥇 <b>TRADE PLACED — Manny's Gold V3</b>\n\n"
-            f"📊 Signal: {signal}\n"
-            f"💰 XAUUSD | {get_session()} Session\n"
+            f"🥇 <b>TRADE PLACED — Manny's V3</b>\n\n"
+            f"📊 {signal} | {sym}\n"
+            f"🏦 {get_session()} | {dst_str}\n"
             f"📈 Entry: {result.price}\n"
             f"🛑 SL: {sl_price}\n"
             f"🎯 TP: {tp_price}\n"
@@ -484,22 +448,23 @@ def place_trade(signal, sl_price, tp_price, lot_size):
             f"💼 Balance: {account.balance} GBP\n"
             f"⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
         )
-        print(f"✅ {signal} placed | Entry:{result.price} SL:{sl_price} TP:{tp_price}")
+        print(f"✅ {sym} {signal} | Entry:{result.price} SL:{sl_price} TP:{tp_price}")
 
 # ═══════════════════════════════════════════
-# MAIN SIGNAL CHECK
+# MAIN SIGNAL CHECK — symbol aware
 # ═══════════════════════════════════════════
-def check_signal(last_signal_bar, last_bull_bar, last_bear_bar):
-    df_30 = get_candles(TIMEFRAME_30, 500)
-    df_4h = get_candles(TIMEFRAME_4H, 500)
-    df_1h = get_candles(TIMEFRAME_1H, 500)
+def check_signal(last_signal_bar, last_bull_bar, last_bear_bar, symbol=None):
+    sym   = symbol or SYMBOL
+    df_30 = get_candles(TIMEFRAME_30, 500, sym)
+    df_4h = get_candles(TIMEFRAME_4H, 500, sym)
+    df_1h = get_candles(TIMEFRAME_1H, 500, sym)
 
     if df_30 is None or df_4h is None or df_1h is None:
-        print("Failed to get candle data")
+        print(f"Failed to get candle data for {sym}")
         return last_signal_bar, last_bull_bar, last_bear_bar
 
     if len(df_30) < 210:
-        print("Not enough data for EMA200")
+        print(f"Not enough data for EMA200 on {sym}")
         return last_signal_bar, last_bull_bar, last_bear_bar
 
     # --- INDICATORS ---
@@ -510,12 +475,10 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar):
     df_30['adx']    = calc_adx(df_30, ADX_PERIOD)
     df_30['macd'], df_30['macd_sig'] = calc_macd(df_30['close'])
 
-    # Last CLOSED candle
     last        = df_30.iloc[-2]
     current_bar = last['time']
     bar_index   = len(df_30) - 2
 
-    # Cooldown — 8 bars per direction
     bars_since_bull = (bar_index - last_bull_bar) if last_bull_bar is not None else 999
     bars_since_bear = (bar_index - last_bear_bar) if last_bear_bar is not None else 999
     bull_cooled = bars_since_bull > COOLDOWN_BARS
@@ -540,10 +503,10 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar):
     rsi_bull_x = rsi < 40
     rsi_bear_x = rsi > 60
 
-    # --- BIAS ---
-    wb_high, wb_low, wk_bull, wk_bear, wk_rev = get_weekly_bias(df_4h)
+    # --- BIAS using 1H candles ---
+    wb_high, wb_low, wk_bull, wk_bear, wk_rev = get_weekly_bias(df_1h)
     price_in_weekly_range = (wb_high is not None) and (wb_low is not None) and (wb_low < close < wb_high)
-    db_high, db_low, day_bull, day_bear        = get_daily_bias(df_4h)
+    db_high, db_low, day_bull, day_bear        = get_daily_bias(df_1h)
     htf_bull, htf_bear                         = get_htf_ema(df_1h, df_4h)
 
     # --- MIXED BIAS ---
@@ -554,8 +517,8 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar):
     macro_ok      = wk_bull or wk_bear
 
     # --- GATES ---
-    g_str_bull = wk_bull and day_bull and htf_bull and (not ext_bear) and (wk_bull and day_bull)
-    g_str_bear = wk_bear and day_bear and htf_bear and (not ext_bear) and (wk_bear and day_bear)
+    g_str_bull = wk_bull and day_bull and htf_bull and (not ext_bear)
+    g_str_bear = wk_bear and day_bear and htf_bear and (not ext_bear)
     g_med_bull = wk_bear and day_bull and htf_bull and (not ext_bear)
     g_med_bear = wk_bull and day_bear and htf_bear and (not ext_bear)
     g_sca_bull = price_in_weekly_range and day_bull and htf_bull and (not ext_bear)
@@ -680,12 +643,12 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar):
     short_sz = max(0.01, round(risk_amt / (short_risk * 100), 2))
 
     # --- DST INFO ---
-    h1, h2 = get_bias_hours()
-    dst_str = "BST (Summer)" if h1 == 2 else "GMT (Winter)"
+    h1, h2  = get_bias_hours()
+    dst_str = "BST" if h1 == 2 else "GMT"
 
     # --- STATUS PRINT ---
     print(f"\n{'='*55}")
-    print(f"⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC | {get_session()} | {dst_str}")
+    print(f"📈 {sym} | {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC | {get_session()} | {dst_str}")
     print(f"📊 Close:{close:.2f} EMA200:{ema200:.2f} EMA50:{ema50:.2f}")
     print(f"📈 RSI:{rsi:.1f} ADX:{adx_val:.1f} ATR:{atr:.2f}")
     print(f"🧭 WkBull:{wk_bull} WkBear:{wk_bear} | DayBull:{day_bull} DayBear:{day_bear}")
@@ -694,16 +657,17 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar):
     print(f"🔒 HTFBull:{htf_bull} HTFBear:{htf_bear} ExtBear:{ext_bear}")
     print(f"🏗 S2L:{s2_long}/5 S2S:{s2_short}/5 | BonL:{bon_l}/7 BonS:{bon_s}/7")
     print(f"🎯 TrigBull:{any_trig_bull} TrigBear:{any_trig_bear}")
-    print(f"⏳ Cooldown — Bull:{bars_since_bull}bars Bear:{bars_since_bear}bars")
+    print(f"⏳ Bull:{bars_since_bull}bars Bear:{bars_since_bear}bars")
     print(f"🚦 Bull:{raw_bull}({bull_tier}) Bear:{raw_bear}({bear_tier})")
 
     # --- FIRE SIGNAL ---
     if raw_bull:
         emoji = "🔥" if bull_tier == "STRONG" else "💪" if bull_tier == "MEDIUM" else "⚡"
-        print(f"\n{emoji} BUY SIGNAL — {bull_tier}")
+        print(f"\n{emoji} BUY SIGNAL — {sym} — {bull_tier}")
         send_telegram(
-            f"{emoji} <b>{bull_tier} BUY — Manny's Gold V3</b>\n\n"
-            f"📊 XAUUSD | {get_session()} | {dst_str}\n"
+            f"{emoji} <b>{bull_tier} BUY — {sym}</b>\n\n"
+            f"📊 Manny's Strategy V3\n"
+            f"🏦 {get_session()} | {dst_str}\n"
             f"📈 Entry: {close:.2f}\n"
             f"🛑 SL: {long_sl}\n"
             f"🎯 TP: {long_tp}\n"
@@ -711,15 +675,16 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar):
             f"🏗 S2:{s2_long}/5 Bonus:{bon_l}/7\n"
             f"⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC"
         )
-        place_trade("BUY", long_sl, long_tp, long_sz)
+        place_trade("BUY", long_sl, long_tp, long_sz, sym)
         return current_bar, bar_index, last_bear_bar
 
     elif raw_bear:
         emoji = "🔥" if bear_tier == "STRONG" else "💪" if bear_tier == "MEDIUM" else "⚡"
-        print(f"\n{emoji} SELL SIGNAL — {bear_tier}")
+        print(f"\n{emoji} SELL SIGNAL — {sym} — {bear_tier}")
         send_telegram(
-            f"{emoji} <b>{bear_tier} SELL — Manny's Gold V3</b>\n\n"
-            f"📊 XAUUSD | {get_session()} | {dst_str}\n"
+            f"{emoji} <b>{bear_tier} SELL — {sym}</b>\n\n"
+            f"📊 Manny's Strategy V3\n"
+            f"🏦 {get_session()} | {dst_str}\n"
             f"📈 Entry: {close:.2f}\n"
             f"🛑 SL: {short_sl}\n"
             f"🎯 TP: {short_tp}\n"
@@ -727,28 +692,30 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar):
             f"🏗 S2:{s2_short}/5 Bonus:{bon_s}/7\n"
             f"⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC"
         )
-        place_trade("SELL", short_sl, short_tp, short_sz)
+        place_trade("SELL", short_sl, short_tp, short_sz, sym)
         return current_bar, last_bull_bar, bar_index
 
     return current_bar, last_bull_bar, last_bear_bar
 
 # ═══════════════════════════════════════════
-# MAIN LOOP
+# MAIN LOOP — scans all symbols
 # ═══════════════════════════════════════════
 def run():
-    print("🚀 Manny's Gold Strategy V3 — Mixed Bias Edition")
+    print("🚀 Manny's Strategy V3 — Mixed Bias Edition")
     print("📊 STRONG / MEDIUM / SCALP tiers")
     print("🕐 Auto DST detection active")
+    print(f"📈 Scanning: {', '.join(SYMBOLS)}")
     print("="*55)
 
-    h1, h2 = get_bias_hours()
-    dst = "BST (Summer)" if h1 == 2 else "GMT (Winter)"
-    print(f"🕐 Current mode: {dst} | Bias hours: {h1}AM + {h2}AM UTC")
+    h1, h2  = get_bias_hours()
+    dst     = "BST (Summer)" if h1 == 2 else "GMT (Winter)"
+    print(f"🕐 {dst} | Bias hours: {h1}AM + {h2}AM UTC")
 
     send_telegram(
-        f"🚀 <b>Manny's Gold V3 Started!</b>\n"
+        f"🚀 <b>Manny's Strategy V3 Started!</b>\n"
         f"📊 Mixed Bias — STRONG/MEDIUM/SCALP\n"
-        f"🕐 {dst} | Bias candles: {h1}AM + {h2}AM UTC\n"
+        f"🕐 {dst} | Bias: {h1}AM + {h2}AM UTC\n"
+        f"📈 Pairs: {', '.join(SYMBOLS)}\n"
         f"⏰ Scanning every 60 seconds\n"
         f"🏦 London | Overlap | NY | Post-NY"
     )
@@ -759,24 +726,34 @@ def run():
 
     print("✅ MT5 Connected!")
 
-    last_signal_bar = None
-    last_bull_bar   = None
-    last_bear_bar   = None
+    # Track signal state per symbol
+    signal_state = {
+        s: {"last_signal_bar": None, "last_bull_bar": None, "last_bear_bar": None}
+        for s in SYMBOLS
+    }
 
     while True:
         now = datetime.now(timezone.utc)
         if is_active_session():
             print(f"\n[{now.strftime('%H:%M:%S')} UTC] Scanning | {get_session()}")
-            try:
-                last_signal_bar, last_bull_bar, last_bear_bar = check_signal(
-                    last_signal_bar, last_bull_bar, last_bear_bar
-                )
-            except Exception as e:
-                print(f"❌ Error: {e}")
-                send_telegram(f"⚠️ Scanner error: {e}")
+            for sym in SYMBOLS:
+                try:
+                    state = signal_state[sym]
+                    new_sig, new_bull, new_bear = check_signal(
+                        state["last_signal_bar"],
+                        state["last_bull_bar"],
+                        state["last_bear_bar"],
+                        symbol=sym
+                    )
+                    signal_state[sym]["last_signal_bar"] = new_sig
+                    signal_state[sym]["last_bull_bar"]   = new_bull
+                    signal_state[sym]["last_bear_bar"]   = new_bear
+                except Exception as e:
+                    print(f"❌ {sym} Error: {e}")
+                    send_telegram(f"⚠️ {sym} error: {e}")
         else:
             h1, _ = get_bias_hours()
-            print(f"[{now.strftime('%H:%M:%S')} UTC] 💤 Asian — Next: London 07:00 UTC | Bias: {h1}AM candles")
+            print(f"[{now.strftime('%H:%M:%S')} UTC] 💤 Asian — Next: London 07:00 UTC | Bias: {h1}AM")
 
         time.sleep(CHECK_INTERVAL)
 
