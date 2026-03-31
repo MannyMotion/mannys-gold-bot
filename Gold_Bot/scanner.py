@@ -109,24 +109,21 @@ def connect_mt5():
 
 # ═══════════════════════════════════════════
 # FIX 2 — DYNAMIC FILLING MODE
-# Reads broker's supported fill mode per symbol
 # ═══════════════════════════════════════════
 def get_filling_mode(symbol):
     info = mt5.symbol_info(symbol)
     if info is None:
         return mt5.ORDER_FILLING_IOC
     filling = info.filling_mode
-    if filling & 2:   # IOC
+    if filling & 2:
         return mt5.ORDER_FILLING_IOC
-    elif filling & 1: # FOK
+    elif filling & 1:
         return mt5.ORDER_FILLING_FOK
-    else:             # RETURN
+    else:
         return mt5.ORDER_FILLING_RETURN
 
 # ═══════════════════════════════════════════
-# FIX 3 — PROPER LOT SIZE CALCULATION
-# Uses tick value so Silver/Gold/Indices
-# are all sized correctly for 1% risk
+# FIX 3 — SMART LOT SIZING
 # ═══════════════════════════════════════════
 def calc_lot_size(symbol, risk_amount_account, sl_distance_price):
     info = mt5.symbol_info(symbol)
@@ -197,7 +194,7 @@ def calc_macd(series):
     return macd, signal
 
 # ═══════════════════════════════════════════
-# WEEKLY BIAS — 1H candles + forex range fix
+# WEEKLY BIAS
 # ═══════════════════════════════════════════
 def get_weekly_bias(df_1h):
     bias_h1, bias_h2 = get_bias_hours()
@@ -221,7 +218,6 @@ def get_weekly_bias(df_1h):
     wb_high = this_week['high'].max()
     wb_low  = this_week['low'].min()
 
-    # Forex range fix
     price_scale = wb_high if wb_high > 1 else 1
     if (wb_high - wb_low) < price_scale * 0.001:
         recent  = df.tail(24)
@@ -240,7 +236,7 @@ def get_weekly_bias(df_1h):
     return wb_high, wb_low, wk_bull, wk_bear, wk_rev
 
 # ═══════════════════════════════════════════
-# DAILY BIAS — 1H candles + forex range fix
+# DAILY BIAS
 # ═══════════════════════════════════════════
 def get_daily_bias(df_1h):
     bias_h1, _ = get_bias_hours()
@@ -271,8 +267,7 @@ def get_daily_bias(df_1h):
     return db_high, db_low, c > db_high, c < db_low
 
 # ═══════════════════════════════════════════
-# HTF EMA — matches Pine Script isDayTF logic
-# 15M/30M: bull1H OR bull4H
+# HTF EMA
 # ═══════════════════════════════════════════
 def get_htf_ema(df_1h, df_4h):
     ema200_1h = calc_ema(df_1h['close'], 200).iloc[-1]
@@ -334,9 +329,7 @@ def check_bos(df, atr_series, bos_reset=30):
     return bull_bos.iloc[-bos_reset:].any(), bear_bos.iloc[-bos_reset:].any()
 
 # ═══════════════════════════════════════════
-# SWEEPS — matches Pine Script exactly
-# bullSweep = low < d1L and close > d1L
-# bearSweep = high > d1H and close < d1H
+# SWEEPS
 # ═══════════════════════════════════════════
 def check_sweeps(df, atr_series, d1h, d1l):
     if d1h is None or d1l is None:
@@ -378,69 +371,57 @@ def check_eql_swept(df, atr):
     return eqh_swept, eql_swept
 
 # ═══════════════════════════════════════════
-# FVG — matches Pine Script exactly
-# bFVGSz = low[1] - high[2]  (1 bar ago low minus 3 bars ago high)
-# Entry zone fires when price enters the gap with displacement
+# FVG
 # ═══════════════════════════════════════════
 def check_fvg(df, atr_series, above_e200, below_e200,
               wk_bull, wk_bear, day_bull, day_bear,
               bias_med_bull, bias_med_bear,
               bias_sca_bull, bias_sca_bear):
     if len(df) < 6:
-        return False, False
+        return False, False, None, None
 
-    # Using closed bars: -2=last closed, -3=prev1, -4=prev2, -5=prev3
-    c0    = df.iloc[-1]   # current bar forming
-    c1    = df.iloc[-2]   # last closed  = close[0] in Pine
-    c2    = df.iloc[-3]   # close[1] in Pine — the impulse candle
-    c3    = df.iloc[-4]   # close[2] in Pine
-    c4    = df.iloc[-5]   # close[3] in Pine — the OB candle gap reference
+    c0  = df.iloc[-1]
+    c1  = df.iloc[-2]
+    c2  = df.iloc[-3]
+    c3  = df.iloc[-4]
 
     atr   = atr_series.iloc[-3]
-
-    body    = abs(c2['close'] - c2['open'])
+    body  = abs(c2['close'] - c2['open'])
     str_cdl = body > atr * 1.0
 
-    # Bull FVG: gap between c3 high and c1 low (Pine: high[2] and low)
     b_fvg_sz  = c1['low']  - c3['high']
-    # Bear FVG: gap between c1 high and c3 low
     br_fvg_sz = c3['low']  - c1['high']
 
     fvg_min = 0.5
     b_fvg   = (b_fvg_sz  > 0) and str_cdl and (c2['close'] > c2['open']) and above_e200 and (b_fvg_sz  >= atr * fvg_min)
     br_fvg  = (br_fvg_sz > 0) and str_cdl and (c2['close'] < c2['open']) and below_e200 and (br_fvg_sz >= atr * fvg_min)
 
-    # Displacement on current bar (entry confirmation)
     disp_cdl = abs(c0['close'] - c0['open']) > atr_series.iloc[-1] * 1.5
 
-    # Price entered the FVG zone
     bull_in_fvg = b_fvg  and (c0['low'] <= c1['low'])   and (c0['close'] >= c3['high'])
     bear_in_fvg = br_fvg and (c0['high'] >= c1['high'])  and (c0['close'] <= c3['low'])
 
     bull_fvg_ez = bull_in_fvg and disp_cdl and above_e200 and (wk_bull or bias_med_bull or bias_sca_bull)
     bear_fvg_ez = bear_in_fvg and disp_cdl and below_e200 and (wk_bear or bias_med_bear or bias_sca_bear)
 
-    return bull_fvg_ez, bear_fvg_ez
+    # Return FVG zone levels for SL calculation
+    bull_fvg_bot = c3['high'] if b_fvg else None  # bottom of bull FVG
+    bear_fvg_top = c3['low']  if br_fvg else None  # top of bear FVG
+
+    return bull_fvg_ez, bear_fvg_ez, bull_fvg_bot, bear_fvg_top
 
 # ═══════════════════════════════════════════
 # FIX 1 — STATEFUL ORDER BLOCK DETECTION
-# Mimics Pine Script var bOBAl / bOBRsp
-# ob_state persists between scan loops
-# An OB forms, gets stored, waits for price
-# to return to the zone — just like Pine Script
 # ═══════════════════════════════════════════
 def check_ob_stateful(df, atr_series, above_e200, below_e200, ob_state, key):
     if len(df) < 8:
-        return False, False
+        return False, False, None, None
 
     close  = df['close']
     open_  = df['open']
     atr    = atr_series.iloc[-2]
     n      = len(df)
 
-    # --- Detect new OB formation ---
-    # Pine: bullImp = 3 consecutive up closes
-    # OB candle = the bearish candle BEFORE the impulse (index -6 = imp3 bars back)
     bull_imp = (close.iloc[-2] > close.iloc[-3] and
                 close.iloc[-3] > close.iloc[-4] and
                 close.iloc[-4] > close.iloc[-5])
@@ -449,12 +430,10 @@ def check_ob_stateful(df, atr_series, above_e200, below_e200, ob_state, key):
                 close.iloc[-3] < close.iloc[-4] and
                 close.iloc[-4] < close.iloc[-5])
 
-    # Bull OB candle: 3 bars before impulse, must be bearish + large body
     if bull_imp and above_e200 and len(df) >= 6:
         ob_candle = df.iloc[-6]
         if (ob_candle['close'] < ob_candle['open'] and
                 abs(ob_candle['close'] - ob_candle['open']) > atr * 0.5):
-            # Only store if no active bull OB already
             existing = ob_state[key].get('bull_ob')
             if not existing or not existing.get('active', False):
                 ob_state[key]['bull_ob'] = {
@@ -467,7 +446,6 @@ def check_ob_stateful(df, atr_series, above_e200, below_e200, ob_state, key):
                 }
                 print(f"  🟦 New Bull OB stored: {ob_candle['high']:.5f}-{ob_candle['low']:.5f}")
 
-    # Bear OB candle: 3 bars before impulse, must be bullish + large body
     if bear_imp and below_e200 and len(df) >= 6:
         ob_candle = df.iloc[-6]
         if (ob_candle['close'] > ob_candle['open'] and
@@ -484,40 +462,38 @@ def check_ob_stateful(df, atr_series, above_e200, below_e200, ob_state, key):
                 }
                 print(f"  🟧 New Bear OB stored: {ob_candle['high']:.5f}-{ob_candle['low']:.5f}")
 
-    # --- Check if price is responding to stored OB ---
     bull_ob_rsp = False
     bear_ob_rsp = False
-    current = df.iloc[-2]  # last fully closed bar
+    bull_ob_bot = None   # OB bottom — used for SL placement
+    bear_ob_top = None   # OB top    — used for SL placement
+    current = df.iloc[-2]
 
-    # Bull OB response: price returns to OB zone from above
     bob = ob_state[key].get('bull_ob')
     if bob and bob.get('active') and not bob.get('touched'):
         if current['low'] <= bob['top'] and current['close'] >= bob['bot']:
             bull_ob_rsp = True
+            bull_ob_bot = bob['bot']
             ob_state[key]['bull_ob']['touched'] = True
             print(f"  ✅ Bull OB response fired! Zone: {bob['top']:.5f}-{bob['bot']:.5f}")
-        # Invalidate if price closes below OB bottom
         if current['close'] < bob['bot']:
             ob_state[key]['bull_ob']['active'] = False
 
-    # Bear OB response: price returns to OB zone from below
     bearob = ob_state[key].get('bear_ob')
     if bearob and bearob.get('active') and not bearob.get('touched'):
         if current['high'] >= bearob['bot'] and current['close'] <= bearob['top']:
             bear_ob_rsp = True
+            bear_ob_top = bearob['top']
             ob_state[key]['bear_ob']['touched'] = True
             print(f"  ✅ Bear OB response fired! Zone: {bearob['top']:.5f}-{bearob['bot']:.5f}")
-        # Invalidate if price closes above OB top
         if current['close'] > bearob['top']:
             ob_state[key]['bear_ob']['active'] = False
 
-    # Expire OB after 50 bars
     if bob and (n - bob.get('bar_formed', 0)) > 50:
         ob_state[key]['bull_ob']['active'] = False
     if bearob and (n - bearob.get('bar_formed', 0)) > 50:
         ob_state[key]['bear_ob']['active'] = False
 
-    return bull_ob_rsp, bear_ob_rsp
+    return bull_ob_rsp, bear_ob_rsp, bull_ob_bot, bear_ob_top
 
 # ═══════════════════════════════════════════
 # RSI DIVERGENCE
@@ -537,7 +513,116 @@ def check_rsi_div(df, rsi_series):
     return (p_ll and r_hl), (p_hl and r_ll), (p_hh and r_lh), (p_lh and r_hh)
 
 # ═══════════════════════════════════════════
-# PLACE TRADE — Fix 2 + Fix 3 applied
+# STRUCTURE-BASED SL CALCULATION
+# Matches Pine Script logic exactly:
+# Priority: OB zone → FVG zone → 15-bar local swing → ATR fallback
+# Session-aware buffer: tighter in London/NY, wider in Post-NY
+# TP guaranteed minimum 1:3 RR
+# ═══════════════════════════════════════════
+def calc_structure_sl_tp(
+    close, atr,
+    t1_bull, t2_bull, t1_bear, t2_bear,
+    bull_ob_bot, bear_ob_top,
+    bull_fvg_bot, bear_fvg_top,
+    df,
+    wb_high, wb_low,
+    bull_tier, bear_tier,
+    rr=3.0
+):
+    session = get_session()
+
+    # Session-aware buffer — tighter in London/NY, wider in Post-NY
+    if session in ("London", "New York", "Overlap"):
+        sess_buf = atr * 0.2
+    elif session == "Post-NY":
+        sess_buf = atr * 0.3
+    else:
+        sess_buf = atr * 0.5
+
+    # ── LONG SL ──
+    # Priority 1: Bull OB bottom (if OB was the trigger)
+    # Priority 2: Bull FVG bottom (if FVG was the trigger)
+    # Priority 3: 15-bar local swing low
+    # Priority 4: ATR fallback
+    local_swing_low  = df['low'].iloc[-17:-2].min()   # last 15 closed bars
+    long_sl_atr      = close - atr * 1.5
+
+    if t2_bull and bull_ob_bot is not None:
+        long_sl = bull_ob_bot - sess_buf
+        sl_src_bull = "OB"
+    elif t1_bull and bull_fvg_bot is not None:
+        long_sl = bull_fvg_bot - sess_buf
+        sl_src_bull = "FVG"
+    elif (local_swing_low - sess_buf) > (close - atr * 3):
+        long_sl = local_swing_low - sess_buf
+        sl_src_bull = "Swing"
+    else:
+        long_sl = long_sl_atr
+        sl_src_bull = "ATR"
+
+    long_risk = max(close - long_sl, 0.0001)
+
+    # ── SHORT SL ──
+    local_swing_high = df['high'].iloc[-17:-2].max()
+    short_sl_atr     = close + atr * 1.5
+
+    if t2_bear and bear_ob_top is not None:
+        short_sl = bear_ob_top + sess_buf
+        sl_src_bear = "OB"
+    elif t1_bear and bear_fvg_top is not None:
+        short_sl = bear_fvg_top + sess_buf
+        sl_src_bear = "FVG"
+    elif (local_swing_high + sess_buf) < (close + atr * 3):
+        short_sl = local_swing_high + sess_buf
+        sl_src_bear = "Swing"
+    else:
+        short_sl = short_sl_atr
+        sl_src_bear = "ATR"
+
+    short_risk = max(short_sl - close, 0.0001)
+
+    # ── TP — guaranteed 1:3 minimum, tier-aware ──
+    long_tp_base  = close + long_risk  * rr
+    short_tp_base = close - short_risk * rr
+
+    # MEDIUM: target weekly bias level if beyond 1:3
+    # SCALP: target opposite weekly bias level
+    # STRONG: pure 1:3 from structure SL
+    if bull_tier == "STRONG":
+        long_tp = long_tp_base
+    elif bull_tier == "MEDIUM":
+        if wb_low is not None and wb_low >= long_tp_base:
+            long_tp = wb_low
+        else:
+            long_tp = long_tp_base
+    elif bull_tier == "SCALP":
+        if wb_high is not None and wb_high >= long_tp_base:
+            long_tp = wb_high
+        else:
+            long_tp = long_tp_base
+    else:
+        long_tp = long_tp_base
+
+    if bear_tier == "STRONG":
+        short_tp = short_tp_base
+    elif bear_tier == "MEDIUM":
+        if wb_high is not None and wb_high <= short_tp_base:
+            short_tp = wb_high
+        else:
+            short_tp = short_tp_base
+    elif bear_tier == "SCALP":
+        if wb_low is not None and wb_low <= short_tp_base:
+            short_tp = wb_low
+        else:
+            short_tp = short_tp_base
+    else:
+        short_tp = short_tp_base
+
+    return (round(long_sl, 5),  long_risk,  round(long_tp, 5),  sl_src_bull,
+            round(short_sl, 5), short_risk, round(short_tp, 5), sl_src_bear)
+
+# ═══════════════════════════════════════════
+# PLACE TRADE
 # ═══════════════════════════════════════════
 def place_trade(signal, sl_price, tp_price, lot_size, symbol=None, tf_name="30M"):
     sym  = symbol or SYMBOL
@@ -548,7 +633,7 @@ def place_trade(signal, sl_price, tp_price, lot_size, symbol=None, tf_name="30M"
 
     price      = tick.ask if signal == "BUY" else tick.bid
     order_type = mt5.ORDER_TYPE_BUY if signal == "BUY" else mt5.ORDER_TYPE_SELL
-    filling    = get_filling_mode(sym)  # FIX 2
+    filling    = get_filling_mode(sym)
 
     req = {
         "action":       mt5.TRADE_ACTION_DEAL,
@@ -673,7 +758,7 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar,
     bias_sca_bull = price_in_weekly_range and day_bull
     bias_sca_bear = price_in_weekly_range and day_bear
 
-    # --- GATES (matches Pine Script exactly) ---
+    # --- GATES ---
     g_str_bull = wk_bull and day_bull and htf_bull and (not ext_bear)
     g_str_bear = wk_bear and day_bear and htf_bear and (not ext_bear)
     g_med_bull = wk_bear and day_bull and htf_bull and (not ext_bear)
@@ -709,8 +794,8 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar,
     s2_long  = sum([above_e200, rec_bull_bos, bull_sweep, in_disc, m_bull])
     s2_short = sum([below_e200, rec_bear_bos, bear_sweep, in_prem, m_bear])
 
-    # --- FVG ---
-    bull_fvg_ez, bear_fvg_ez = check_fvg(
+    # --- FVG — now returns zone levels too ---
+    bull_fvg_ez, bear_fvg_ez, bull_fvg_bot, bear_fvg_top = check_fvg(
         df_main, df_main['atr'],
         above_e200, below_e200,
         wk_bull, wk_bear, day_bull, day_bear,
@@ -718,8 +803,8 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar,
         bias_sca_bull, bias_sca_bear
     )
 
-    # --- FIX 1: STATEFUL OB ---
-    bull_ob_rsp, bear_ob_rsp = check_ob_stateful(
+    # --- STATEFUL OB — now returns zone levels too ---
+    bull_ob_rsp, bear_ob_rsp, bull_ob_bot, bear_ob_top = check_ob_stateful(
         df_main, df_main['atr'], above_e200, below_e200, ob_state, key
     )
 
@@ -819,16 +904,23 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar,
     bull_tier = "STRONG" if raw_bull_str else ("MEDIUM" if raw_bull_med else ("SCALP" if raw_bull_sca else ""))
     bear_tier = "STRONG" if raw_bear_str else ("MEDIUM" if raw_bear_med else ("SCALP" if raw_bear_sca else ""))
 
-    # --- SL / TP ---
-    sl_buf     = atr * 0.5
-    long_sl    = round((last_bull_sw_low  - sl_buf) if last_bull_sw_low  else (close - atr * 1.5), 5)
-    short_sl   = round((last_bear_sw_high + sl_buf) if last_bear_sw_high else (close + atr * 1.5), 5)
-    long_risk  = max(close - long_sl,  0.0001)
-    short_risk = max(short_sl - close, 0.0001)
-    long_tp    = round(close + long_risk  * RR, 5)
-    short_tp   = round(close - short_risk * RR, 5)
+    # ═══════════════════════════════════════════
+    # STRUCTURE-BASED SL/TP — NEW LOGIC
+    # Replaces old sweep-based SL with structure-aware placement
+    # ═══════════════════════════════════════════
+    (long_sl, long_risk, long_tp, sl_src_bull,
+     short_sl, short_risk, short_tp, sl_src_bear) = calc_structure_sl_tp(
+        close, atr,
+        t1_bull, t2_bull, t1_bear, t2_bear,
+        bull_ob_bot, bear_ob_top,
+        bull_fvg_bot, bear_fvg_top,
+        df_main,
+        wb_high, wb_low,
+        bull_tier, bear_tier,
+        rr=RR
+    )
 
-    # --- FIX 3: PROPER LOT SIZING ---
+    # --- LOT SIZING ---
     account  = mt5.account_info()
     balance  = account.balance
     risk_amt = balance * RISK_PERCENT
@@ -859,15 +951,16 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar,
     print(f"🎯 Triggers — Bull:{trig_name_bull}({any_trig_bull}) Bear:{trig_name_bear}({any_trig_bear})")
     print(f"⏳ Bull:{bars_since_bull}bars Bear:{bars_since_bear}bars")
     print(f"🚦 Bull:{raw_bull}({bull_tier}) Bear:{raw_bear}({bear_tier})")
+    print(f"📐 SL Source — Bull:{sl_src_bull} Bear:{sl_src_bear}")
 
     # --- FIRE SIGNAL ---
     if raw_bull:
         emoji = "🔥" if bull_tier == "STRONG" else "💪" if bull_tier == "MEDIUM" else "⚡"
-        print(f"\n{emoji} BUY SIGNAL — {sym} {tf_name} — {bull_tier} — Trig:{trig_name_bull}")
+        print(f"\n{emoji} BUY SIGNAL — {sym} {tf_name} — {bull_tier} — Trig:{trig_name_bull} SLsrc:{sl_src_bull}")
         send_telegram(
             f"{emoji} <b>{bull_tier} BUY — {sym} {tf_name}</b>\n\n"
             f"📊 Manny's Strategy V3\n"
-            f"🎯 Trigger: {trig_name_bull}\n"
+            f"🎯 Trigger: {trig_name_bull} | SL from: {sl_src_bull}\n"
             f"🏦 {get_session()} | {dst_str}\n"
             f"📈 Entry: {close:.5f}\n"
             f"🛑 SL: {long_sl}\n"
@@ -881,11 +974,11 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar,
 
     elif raw_bear:
         emoji = "🔥" if bear_tier == "STRONG" else "💪" if bear_tier == "MEDIUM" else "⚡"
-        print(f"\n{emoji} SELL SIGNAL — {sym} {tf_name} — {bear_tier} — Trig:{trig_name_bear}")
+        print(f"\n{emoji} SELL SIGNAL — {sym} {tf_name} — {bear_tier} — Trig:{trig_name_bear} SLsrc:{sl_src_bear}")
         send_telegram(
             f"{emoji} <b>{bear_tier} SELL — {sym} {tf_name}</b>\n\n"
             f"📊 Manny's Strategy V3\n"
-            f"🎯 Trigger: {trig_name_bear}\n"
+            f"🎯 Trigger: {trig_name_bear} | SL from: {sl_src_bear}\n"
             f"🏦 {get_session()} | {dst_str}\n"
             f"📈 Entry: {close:.5f}\n"
             f"🛑 SL: {short_sl}\n"
@@ -911,6 +1004,7 @@ def run():
     print("🟦 Stateful OB memory — stores OBs between scans")
     print("🔧 Dynamic fill mode — auto detects per symbol")
     print("📐 Smart lot sizing — tick value based")
+    print("🎯 Structure-based SL — OB/FVG/Swing priority")
     print("="*55)
 
     h1, h2  = get_bias_hours()
@@ -918,7 +1012,7 @@ def run():
     print(f"🕐 {dst} | Bias hours: {h1}AM + {h2}AM UTC")
 
     send_telegram(
-        f"🚀 <b>Manny's Strategy V3 — Fixed Edition</b>\n\n"
+        f"🚀 <b>Manny's Strategy V3 — Structure SL Edition</b>\n\n"
         f"📊 Mixed Bias — STRONG/MEDIUM/SCALP\n"
         f"🕐 {dst} | Bias: {h1}AM + {h2}AM UTC\n"
         f"📈 Pairs: {', '.join(SYMBOLS)}\n"
@@ -926,6 +1020,7 @@ def run():
         f"🟦 Stateful OB active\n"
         f"🔧 Auto fill mode per symbol\n"
         f"📐 Smart lot sizing active\n"
+        f"🎯 Structure SL: OB → FVG → Swing → ATR\n"
         f"⏰ Scanning every 60 seconds\n"
         f"🏦 London | Overlap | NY | Post-NY"
     )
@@ -936,10 +1031,8 @@ def run():
 
     print("✅ MT5 Connected!")
 
-    # OB state persists across ALL scan loops — this is the key fix
     ob_state = {}
 
-    # Signal state per symbol per timeframe
     signal_state = {}
     for s in SYMBOLS:
         for tf in SYMBOL_TIMEFRAMES.get(s, [mt5.TIMEFRAME_M30]):
